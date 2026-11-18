@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -318,6 +319,7 @@ func NewFunctionComposer(cached, uncached client.Client, r FunctionRunner, o ...
 // Compose resources using the Functions pipeline.
 func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructured, req CompositionRequest) (CompositionResult, error) { //nolint:gocognit // We probably don't want any further abstraction for the sake of reduced complexity.
 	ctx = step.ForCompositions(ctx)
+	observedGeneration := xr.GetGeneration()
 	// Observe our existing composed resources. We need to do this before we
 	// render any P&T templates, so that we can make sure we use the same
 	// composed resource names (as in, metadata.name) every time. We know what
@@ -734,10 +736,62 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	// Reconciler uses this array to determine whether the XR is ready.
 	resources := make([]ComposedResource, 0, len(desired))
 
+	// Determine the order resources may be applied in. Resources that declare
+	// dependencies using AnnotationKeyDependsOn (or spec.crossplane.dependsOn)
+	// are only applied once everything they depend on exists and is ready.
+	// Resources with no declared dependencies retain the previous behaviour and
+	// are applied immediately.
+	order, waiting, err := PlanComposedResourceApply(desired, observed)
+	if err != nil {
+		return CompositionResult{}, errors.Wrap(err, "cannot order composed resources")
+	}
+
+	// A dependency that fails during this pass must also hold back its
+	// dependents. PlanComposedResourceApply only knows about resources observed
+	// before this pass, so update its decisions as applies fail.
+	blocked := make(map[ResourceName][]ResourceName, len(waiting))
+	maps.Copy(blocked, waiting)
+	failed := make(map[ResourceName]bool)
+
 	// We apply all of our desired resources before we observe them in the loop
 	// below. This ensures that issues observing and processing one composed
 	// resource won't block the application of another.
-	for name, cd := range desired {
+	for _, name := range order {
+		cd := desired[name]
+		dependencies := dependenciesOfState(cd)
+
+		unmet := blocked[name]
+		if len(unmet) == 0 {
+			for _, dep := range dependencies {
+				if failed[dep] || len(blocked[dep]) > 0 {
+					unmet = append(unmet, dep)
+				}
+			}
+		}
+
+		if len(unmet) > 0 {
+			blocked[name] = unmet
+			affected := make([]string, 0, len(unmet)+1)
+			affected = append(affected, string(name))
+			for _, dep := range unmet {
+				affected = append(affected, string(dep))
+			}
+
+			// The resource isn't failed, it just isn't this resource's turn.
+			// Keep Synced true so callers can distinguish "waiting" from
+			// "cannot sync".
+			resources = append(resources, ComposedResource{
+				ResourceName:      name,
+				Ready:             false,
+				Synced:            true,
+				FailureReason:     xpv2.ReasonWaitingForDependencies,
+				Message:           fmt.Sprintf("waiting for dependencies: %s", strings.Join(namesToStrings(unmet), ", ")),
+				AffectedResources: affected,
+				Dependencies:      dependencies,
+			})
+			continue
+		}
+
 		// We don't need any crossplane-runtime resource.Applicator style apply
 		// options here because server-side apply takes care of everything.
 		// Specifically it will merge rather than replace owner references (e.g.
@@ -748,7 +802,7 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 		// continuously alternated as controllers.
 		//nolint:staticcheck // TODO(adamwg) Stop using client.Apply after the v2.2 release.
 		if err := c.client.Patch(ctx, cd.Resource, client.Apply, client.ForceOwnership, client.FieldOwner(ComposedFieldOwnerName(xr))); err != nil {
-			if kerrors.IsInvalid(err) {
+			if kerrors.IsInvalid(err) || kerrors.IsForbidden(err) || kerrors.IsUnauthorized(err) {
 				// We tried applying an invalid resource, we can't tell whether
 				// this means the resource will never be valid or it will if we
 				// run again the composition after some other resource is
@@ -765,7 +819,20 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 				// p&t composer, as we respect the readiness reported by
 				// functions, while there we defaulted to also set ready false
 				// in case of apply errors.
-				resources = append(resources, ComposedResource{ResourceName: name, Ready: cd.Ready, Synced: false})
+				reason := xpv2.ReasonResourceCreationFailed
+				if kerrors.IsForbidden(err) || kerrors.IsUnauthorized(err) {
+					reason = xpv2.ReasonPolicyValidationFailed
+				}
+				resources = append(resources, ComposedResource{
+					ResourceName:      name,
+					Ready:             false,
+					Synced:            false,
+					FailureReason:     reason,
+					Message:           err.Error(),
+					AffectedResources: []string{string(name)},
+					Dependencies:      dependencies,
+				})
+				failed[name] = true
 
 				continue
 			}
@@ -776,7 +843,12 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 				Err:      err,
 			}
 		}
-		resources = append(resources, ComposedResource{ResourceName: name, Ready: cd.Ready, Synced: true})
+		resources = append(resources, ComposedResource{
+			ResourceName: name,
+			Ready:        cd.Ready,
+			Synced:       true,
+			Dependencies: dependencies,
+		})
 	}
 
 	// Our goal here is to patch our XR's status using server-side apply. We
@@ -807,8 +879,8 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	// will set conditions to nil if it's not passed any arguments. SSA
 	// interprets this as null and rejects it, so we only set them if
 	// there's actually some to set.
-	if len(cs) > 0 {
-		xr.SetConditions(cs...)
+	if merged := ConditionsForStatus(observedGeneration, cs, conditions); len(merged) > 0 {
+		xr.SetConditions(merged...)
 	}
 
 	// Keep the recorded deletion policy. The pipeline can't change it, and
@@ -850,14 +922,54 @@ func (c *FunctionComposer) Compose(ctx context.Context, xr *composite.Unstructur
 	c.tracker.Track(xrKey, composed, required)
 
 	return CompositionResult{
-		Composed:          resources,
-		ConnectionDetails: d.GetComposite().GetConnectionDetails(),
-		Ready:             ready,
-		Events:            events,
-		Conditions:        conditions,
-		TTL:               ttl,
-		Existing:          len(controlled(xr, observed)),
+		Composed:           resources,
+		ConnectionDetails:  d.GetComposite().GetConnectionDetails(),
+		Ready:              ready,
+		Events:             events,
+		Conditions:         conditions,
+		TTL:                ttl,
+		Existing:           len(controlled(xr, observed)),
+		ObservedGeneration: observedGeneration,
 	}, nil
+}
+
+// ConditionsForStatus merges conditions read at the start of a reconcile with
+// conditions produced by this reconcile. It is used before the composer's
+// server-side status apply so a stale cached read can't write an older
+// condition over a newer one. System conditions from an older generation are
+// dropped, while non-system conditions are preserved for backwards
+// compatibility with functions that don't record generations.
+func ConditionsForStatus(generation int64, existing []xpv2.Condition, produced []TargetedCondition) []xpv2.Condition {
+	merged := make([]xpv2.Condition, 0, len(existing)+len(produced))
+	index := make(map[xpv2.ConditionType]int, len(existing)+len(produced))
+
+	add := func(c xpv2.Condition) {
+		if i, ok := index[c.Type]; ok {
+			merged[i] = c
+			return
+		}
+		index[c.Type] = len(merged)
+		merged = append(merged, c)
+	}
+
+	for _, c := range existing {
+		if v1.IsSystemConditionType(c.Type) && c.ObservedGeneration != 0 && c.ObservedGeneration < generation {
+			continue
+		}
+		add(c)
+	}
+
+	for _, c := range produced {
+		if v1.IsSystemConditionType(c.Type) {
+			// Functions can't override system conditions.
+			continue
+		}
+		condition := c.Condition
+		condition.ObservedGeneration = generation
+		add(condition)
+	}
+
+	return merged
 }
 
 // referenced returns the composed resources the XR should reference: everything

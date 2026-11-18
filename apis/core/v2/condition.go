@@ -17,6 +17,7 @@ limitations under the License.
 package v2
 
 import (
+	"slices"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,6 +62,28 @@ const (
 	ReasonUnavailable ConditionReason = "Unavailable"
 	ReasonCreating    ConditionReason = "Creating"
 	ReasonDeleting    ConditionReason = "Deleting"
+
+	// ReasonWaitingForDependencies indicates that a composite resource is not
+	// ready because one or more resources it depends on do not exist yet, or
+	// are not ready yet. AffectedResources names the dependencies that are
+	// being waited on.
+	ReasonWaitingForDependencies ConditionReason = "WaitingForDependencies"
+
+	// ReasonResourceCreationFailed indicates that one or more composed
+	// resources could not be created or updated. AffectedResources names the
+	// resources that failed.
+	ReasonResourceCreationFailed ConditionReason = "ResourceCreationFailed"
+
+	// ReasonPolicyValidationFailed indicates that one or more composed
+	// resources were rejected by an admission, management, or composition
+	// policy. AffectedResources names the rejected resources.
+	ReasonPolicyValidationFailed ConditionReason = "PolicyValidationFailed"
+
+	// ReasonSyncComplete indicates that all composed resources have been
+	// created or updated, and all of their readiness checks passed.
+	// AffectedResources names the composed resources covered by the
+	// condition.
+	ReasonSyncComplete ConditionReason = "SyncComplete"
 )
 
 // Reasons a resource is or is not synced.
@@ -106,6 +129,17 @@ type Condition struct { //nolint:recvcheck // False positive - only has non-poin
 	// with respect to the current state of the instance.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// AffectedResources names the resources whose state caused this condition.
+	// For a composite resource's Ready condition this is usually a list of
+	// composition resource names (the keys used in a Composition Function's
+	// desired resources), not Kubernetes object names. It is empty when the
+	// condition is not about specific resources. Consumers must not assume
+	// the list is ordered or that it contains every resource involved; it is
+	// intended to help humans and tooling identify what to investigate.
+	// +optional
+	// +listType=set
+	AffectedResources []string `json:"affectedResources,omitempty"`
 }
 
 // Equal returns true if the condition is identical to the supplied condition,
@@ -116,13 +150,26 @@ func (c Condition) Equal(other Condition) bool {
 		return c.Type == other.Type &&
 			c.Status == other.Status &&
 			c.Reason == other.Reason &&
-			c.Message == other.Message
+			c.Message == other.Message &&
+			equalStringSets(c.AffectedResources, other.AffectedResources)
 	}
 	return c.Type == other.Type &&
 		c.Status == other.Status &&
 		c.Reason == other.Reason &&
 		c.Message == other.Message &&
-		c.ObservedGeneration == other.ObservedGeneration
+		c.ObservedGeneration == other.ObservedGeneration &&
+		equalStringSets(c.AffectedResources, other.AffectedResources)
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ac := slices.Clone(a)
+	bc := slices.Clone(b)
+	sort.Strings(ac)
+	sort.Strings(bc)
+	return slices.Equal(ac, bc)
 }
 
 // WithMessage returns a condition by adding the provided message to existing
@@ -137,6 +184,32 @@ func (c Condition) WithMessage(msg string) Condition {
 func (c Condition) WithObservedGeneration(gen int64) Condition {
 	c.ObservedGeneration = gen
 	return c
+}
+
+// WithAffectedResources returns a condition with the supplied resources
+// recorded as affected by it. Duplicates are removed while preserving the
+// order in which resources were first supplied.
+func (c Condition) WithAffectedResources(resources ...string) Condition {
+	c.AffectedResources = uniqueStrings(resources)
+	return c
+}
+
+// uniqueStrings removes duplicates and empty strings, preserving order.
+func uniqueStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // IsSystemConditionType returns true if the condition is owned by the
@@ -287,6 +360,58 @@ func Unavailable() Condition {
 		Status:             corev1.ConditionFalse,
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonUnavailable,
+	}
+}
+
+// WaitingForDependencies returns a condition indicating that the resource is
+// not ready because the supplied dependencies are not ready yet. The supplied
+// names are recorded in AffectedResources.
+func WaitingForDependencies(resources ...string) Condition {
+	return Condition{
+		Type:               TypeReady,
+		Status:             corev1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonWaitingForDependencies,
+		AffectedResources:  uniqueStrings(resources),
+	}
+}
+
+// ResourceCreationFailed returns a condition indicating that the resource is
+// not ready because the supplied resources could not be created or updated.
+// The supplied names are recorded in AffectedResources.
+func ResourceCreationFailed(resources ...string) Condition {
+	return Condition{
+		Type:               TypeReady,
+		Status:             corev1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonResourceCreationFailed,
+		AffectedResources:  uniqueStrings(resources),
+	}
+}
+
+// PolicyValidationFailed returns a condition indicating that the resource is
+// not ready because the supplied resources were rejected by a policy. The
+// supplied names are recorded in AffectedResources.
+func PolicyValidationFailed(resources ...string) Condition {
+	return Condition{
+		Type:               TypeReady,
+		Status:             corev1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonPolicyValidationFailed,
+		AffectedResources:  uniqueStrings(resources),
+	}
+}
+
+// SyncComplete returns a condition indicating that every composed resource
+// has been synced and is ready. The supplied names are recorded in
+// AffectedResources.
+func SyncComplete(resources ...string) Condition {
+	return Condition{
+		Type:               TypeReady,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonSyncComplete,
+		AffectedResources:  uniqueStrings(resources),
 	}
 }
 

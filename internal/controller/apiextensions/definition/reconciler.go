@@ -55,6 +55,7 @@ import (
 	"github.com/crossplane/crossplane/v2/internal/controller/apiextensions/composite/dependency"
 	"github.com/crossplane/crossplane/v2/internal/controller/apiextensions/composite/watch"
 	apiextensionscontroller "github.com/crossplane/crossplane/v2/internal/controller/apiextensions/controller"
+	"github.com/crossplane/crossplane/v2/internal/controller/apiextensions/crdschema"
 	"github.com/crossplane/crossplane/v2/internal/controller/apiextensions/ownership"
 	"github.com/crossplane/crossplane/v2/internal/engine"
 	"github.com/crossplane/crossplane/v2/internal/features"
@@ -268,8 +269,15 @@ func NewReconciler(ca resource.ClientApplicator, opts ...ReconcilerOption) *Reco
 		client: ca,
 
 		composite: definition{
-			CRDRenderer: CRDRenderFn(xcrd.ForCompositeResource),
-			Finalizer:   resource.NewAPIFinalizer(ca.Client, finalizer),
+			CRDRenderer: CRDRenderFn(func(d *v1.CompositeResourceDefinition) (*extv1.CustomResourceDefinition, error) {
+				crd, err := xcrd.ForCompositeResource(d)
+				if err != nil {
+					return nil, err
+				}
+				crdschema.EnsureConditionAffectedResources(crd)
+				return crd, nil
+			}),
+			Finalizer: resource.NewAPIFinalizer(ca.Client, finalizer),
 		},
 
 		engine: &NopEngine{},

@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -84,6 +85,7 @@ const (
 	errSyncResources        = "cannot sync composed resources"
 	errGetClaim             = "cannot get referenced claim"
 	errParseClaimRef        = "cannot parse claim reference"
+	errStaleComposition     = "composition result is stale"
 
 	reconcilePausedMsg    = "Reconciliation (including deletion) is paused via the pause annotation"
 	waitingForPipelineMsg = "Waiting for the function pipeline to delete composed resources"
@@ -101,6 +103,9 @@ const (
 	reasonPaused                  event.Reason = "ReconciliationPaused"
 	reasonNamespaceOverridden     event.Reason = "NamespaceOverridden"
 	reasonReconcileRequestHandled event.Reason = "ReconcileRequestHandled"
+	reasonWaitingForDependencies  event.Reason = "WaitingForDependencies"
+	reasonResourceCreationFailed  event.Reason = "ResourceCreationFailed"
+	reasonPolicyValidationFailed  event.Reason = "PolicyValidationFailed"
 )
 
 // Condition reasons.
@@ -246,6 +251,13 @@ type CompositionResult struct {
 
 	// Existing is how many of the XR's composed resources still exist.
 	Existing int
+
+	// ObservedGeneration is the XR generation this result was computed from.
+	// The reconciler uses it to avoid applying a result from an older
+	// generation after the XR's spec has changed. A zero value means the
+	// composer didn't record a generation; callers should treat the result as
+	// current for backwards compatibility.
+	ObservedGeneration int64
 }
 
 // A CompositionTarget is the target of a composition event or condition.
@@ -849,6 +861,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 
 	res, err := r.resource.Compose(ctx, xr, CompositionRequest{Revision: rev})
+	// A composition run takes time. If the XR's spec changed while it was
+	// running, the result describes an older generation. Applying it could
+	// replace a newer condition (or resource reference) with an older one, so
+	// discard it and let the update event trigger a fresh reconcile.
+	if isStaleCompositionResult(res, xr.GetGeneration()) {
+		err := errors.Errorf("%s: composed generation %d, current generation %d", errStaleComposition, res.ObservedGeneration, xr.GetGeneration())
+		log.Debug(errCompose, "error", err)
+		r.record.Event(xr, event.Warning(reasonCompose, err))
+		return reconcile.Result{Requeue: true}, nil
+	}
 	if err != nil {
 		log.Debug(errCompose, "error", err)
 
@@ -963,6 +985,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			id = strconv.Itoa(i)
 		}
 
+		switch cd.FailureReason {
+		case xpv2.ReasonWaitingForDependencies:
+			log.Debug("Composed resource is waiting for dependencies", "id", id, "dependencies", cd.AffectedResources)
+			r.record.Event(xr, event.Normal(reasonWaitingForDependencies, fmt.Sprintf("Composed resource %q is waiting for dependencies: %s", id, strings.Join(cd.AffectedResources, ", "))))
+		case xpv2.ReasonResourceCreationFailed:
+			log.Debug("Composed resource failed to create", "id", id, "error", cd.Message)
+			r.record.Event(xr, event.Warning(reasonResourceCreationFailed, errors.Errorf("composed resource %q failed to create: %s", id, cd.Message)))
+		case xpv2.ReasonPolicyValidationFailed:
+			log.Debug("Composed resource rejected by policy", "id", id, "error", cd.Message)
+			r.record.Event(xr, event.Warning(reasonPolicyValidationFailed, errors.Errorf("composed resource %q was rejected by policy: %s", id, cd.Message)))
+		}
+
 		if !cd.Synced {
 			log.Debug("Composed resource is not yet valid", "id", id)
 			unsynced = append(unsynced, id)
@@ -976,24 +1010,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	synced := xpv2.ReconcileSuccess()
-	if len(unsynced) > 0 {
-		synced = xpv2.ReconcileError(errors.New(errSyncResources)).WithMessage(fmt.Sprintf("Unsynced resources: %s", resource.StableNAndSomeMore(resource.DefaultFirstN, unsynced)))
-	}
-
-	ready := xpv2.Available()
-	if len(unready) > 0 {
-		ready = xpv2.Creating().WithMessage(fmt.Sprintf("Unready resources: %s", resource.StableNAndSomeMore(resource.DefaultFirstN, unready)))
-	}
-
-	// If the composer explicitly specified the XR's readiness it
-	// supersedes readiness derived from composed resources.
-	if res.Ready != nil {
-		ready = xpv2.Creating()
-		if *res.Ready {
-			ready = xpv2.Available()
-		}
-	}
+	ready, synced := AggregateCompositionConditions(res)
 
 	if deleting {
 		ready = xpv2.Deleting().WithMessage(waitingForPipelineMsg)
@@ -1023,6 +1040,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return result, errors.Wrap(r.client.Status().Update(updateCtx, xr), errUpdateStatus)
 	}
 	return result, nil
+}
+
+// isStaleCompositionResult returns true when the composer produced a result
+// for an older generation than the XR's current generation. A zero observed
+// generation means the composer didn't record one, so the result is treated as
+// current for backwards compatibility.
+func isStaleCompositionResult(res CompositionResult, generation int64) bool {
+	return res.ObservedGeneration > 0 && res.ObservedGeneration < generation
 }
 
 // deleteInForeground deletes the XR's composed resources, and removes its
@@ -1171,6 +1196,20 @@ func (r *Reconciler) handleCommonCompositionResult(ctx context.Context, res Comp
 	for _, c := range res.Conditions {
 		if v1.IsSystemConditionType(c.Type) {
 			// Do not let users update system conditions.
+			continue
+		}
+
+		// Function results carry the generation they were computed from when
+		// available. Never let a result for an older generation replace a
+		// condition that has already observed a newer one. Conditions that
+		// don't record a generation are assumed to be current, which keeps
+		// functions built against older protocols working.
+		if c.ObservedGeneration == 0 {
+			c.ObservedGeneration = xr.GetGeneration()
+		}
+		existing := xr.GetCondition(c.Type)
+		if existing.ObservedGeneration > c.ObservedGeneration {
+			log.Debug("Ignoring condition from an older generation", "type", c.Type, "condition-generation", c.ObservedGeneration, "observed-generation", existing.ObservedGeneration)
 			continue
 		}
 

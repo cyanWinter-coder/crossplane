@@ -98,6 +98,45 @@ func TestConditionEqual(t *testing.T) {
 			b:    Condition{ObservedGeneration: 2},
 			want: false,
 		},
+		"DifferentAffectedResources": {
+			a: Condition{
+				Type:              TypeReady,
+				AffectedResources: []string{"database"},
+			},
+			b: Condition{
+				Type:              TypeReady,
+				AffectedResources: []string{"bucket"},
+			},
+			want: false,
+		},
+		"IdenticalAffectedResources": {
+			a: Condition{
+				Type:               TypeReady,
+				Status:             corev1.ConditionFalse,
+				Reason:             ReasonWaitingForDependencies,
+				AffectedResources:  []string{"database", "bucket"},
+				ObservedGeneration: 3,
+			},
+			b: Condition{
+				Type:               TypeReady,
+				Status:             corev1.ConditionFalse,
+				Reason:             ReasonWaitingForDependencies,
+				AffectedResources:  []string{"database", "bucket"},
+				ObservedGeneration: 3,
+			},
+			want: true,
+		},
+		"AffectedResourcesDifferentOrder": {
+			a: Condition{
+				Type:              TypeReady,
+				AffectedResources: []string{"database", "bucket"},
+			},
+			b: Condition{
+				Type:              TypeReady,
+				AffectedResources: []string{"bucket", "database"},
+			},
+			want: true,
+		},
 		"CheckReconcilePaused": {
 			a: ReconcilePaused(),
 			b: Condition{
@@ -117,6 +156,69 @@ func TestConditionEqual(t *testing.T) {
 				t.Errorf("a.Equal(b): -want, +got:\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestAggregateConditions(t *testing.T) {
+	cases := map[string]struct {
+		c    Condition
+		want Condition
+	}{
+		"WaitingForDependencies": {
+			c: WaitingForDependencies("database", "bucket", "database"),
+			want: Condition{
+				Type:              TypeReady,
+				Status:            corev1.ConditionFalse,
+				Reason:            ReasonWaitingForDependencies,
+				AffectedResources: []string{"database", "bucket"},
+			},
+		},
+		"ResourceCreationFailed": {
+			c: ResourceCreationFailed("database"),
+			want: Condition{
+				Type:              TypeReady,
+				Status:            corev1.ConditionFalse,
+				Reason:            ReasonResourceCreationFailed,
+				AffectedResources: []string{"database"},
+			},
+		},
+		"PolicyValidationFailed": {
+			c: PolicyValidationFailed("database"),
+			want: Condition{
+				Type:              TypeReady,
+				Status:            corev1.ConditionFalse,
+				Reason:            ReasonPolicyValidationFailed,
+				AffectedResources: []string{"database"},
+			},
+		},
+		"SyncComplete": {
+			c: SyncComplete("database", "bucket"),
+			want: Condition{
+				Type:              TypeReady,
+				Status:            corev1.ConditionTrue,
+				Reason:            ReasonSyncComplete,
+				AffectedResources: []string{"database", "bucket"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := tc.c
+			got.LastTransitionTime = metav1.Time{}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("condition: -want, +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWithAffectedResources(t *testing.T) {
+	got := Available().WithAffectedResources("a", "", "b", "a")
+
+	want := []string{"a", "b"}
+	if diff := cmp.Diff(want, got.AffectedResources); diff != "" {
+		t.Errorf("AffectedResources: -want, +got:\n%s", diff)
 	}
 }
 
